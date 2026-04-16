@@ -1,0 +1,646 @@
+//+------------------------------------------------------------------+
+//| GoldAutoBot.mq4                                                  |
+//| MT4 Expert Advisor for the MT4 Gold Auto Bot                     |
+//|                                                                  |
+//| Reads commands from commands.txt, executes them, and writes a   |
+//| full state snapshot to positions.txt every tick.                 |
+//|                                                                  |
+//| MAGIC number identifies all orders/positions placed by this bot. |
+//| Order comments: "lim:<limit_id> sig:<signal_id>"                 |
+//+------------------------------------------------------------------+
+#property strict
+
+#import "kernel32.dll"
+    int  CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+                     int lpSecurityAttributes, uint dwCreationDisposition,
+                     uint dwFlagsAndAttributes, int hTemplateFile);
+    bool ReadFile(int hFile, uchar &lpBuffer[], uint nNumberOfBytesToRead,
+                  uint &lpNumberOfBytesRead, int lpOverlapped);
+    bool WriteFile(int hFile, const uchar &lpBuffer[], uint nNumberOfBytesToWrite,
+                   uint &lpNumberOfBytesWritten, int lpOverlapped);
+    bool SetFilePointer(int hFile, int lDistanceToMove, int &lpDistanceToMoveHigh,
+                        uint dwMoveMethod);
+    bool SetEndOfFile(int hFile);
+    bool CloseHandle(int hObject);
+#import
+
+#define GENERIC_READ        0x80000000
+#define GENERIC_WRITE       0x40000000
+#define FILE_SHARE_READ     0x00000001
+#define FILE_SHARE_WRITE    0x00000002
+#define OPEN_EXISTING       3
+#define CREATE_ALWAYS       2
+#define INVALID_HANDLE_VALUE -1
+#define FILE_BEGIN          0
+
+//--- EA input: set to the folder containing commands.txt / positions.txt
+extern string ConnectionFilesPath = "C:\\Python Stuff\\MT4-Auto-Execution-Bot\\connection_files";
+// Example (use double backslashes): C:\\Users\\Me\\mt4-gold-bot\\connection_files
+
+//--- Magic number — must match Python bot's MAGIC constant
+#define MAGIC 20250001
+
+//--- Gold symbol on this broker (adjust if suffix differs, e.g. "XAUUSDm")
+extern string GoldSymbol = "XAUUSD";
+
+//--- Python spread estimate to undo before re-applying live spread (must match sync.py)
+extern double PySpreadEstimate = 0.35;
+
+//+------------------------------------------------------------------+
+//| Trailing stop registry (in-memory, reset on EA re-attach)        |
+//| On re-attach Python detects open positions, purges tp_state, and |
+//| re-sends START_TP on next cycle — trails are automatically       |
+//| re-registered without any manual intervention.                   |
+//+------------------------------------------------------------------+
+#define MAX_TRAIL 100
+int    g_trailTickets  [MAX_TRAIL];
+double g_trailDistances[MAX_TRAIL];
+int    g_trailCount = 0;
+
+//--- File paths (built from ConnectionFilesPath)
+string g_cmdPath;
+string g_posPath;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    if (StringLen(ConnectionFilesPath) == 0) {
+        Alert("GoldAutoBot: ConnectionFilesPath is empty — set it in EA inputs.");
+        return INIT_FAILED;
+    }
+    g_cmdPath = ConnectionFilesPath + "\\commands.txt";
+    g_posPath = ConnectionFilesPath + "\\positions.txt";
+
+    EnsureFileExists(g_cmdPath);
+    EnsureFileExists(g_posPath);
+
+    EventSetTimer(1);
+    Print("GoldAutoBot v1.0 initialised | symbol=", GoldSymbol,
+          " | magic=", MAGIC, " | path=", ConnectionFilesPath);
+    WritePositionsFile();
+    return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+    EventKillTimer();
+    Print("GoldAutoBot deinitialised (reason=", reason, ").");
+}
+
+void OnTick()
+{
+    RunTrailingStops();
+    WritePositionsFile();
+}
+
+void OnTimer()
+{
+    ProcessCommandsFile();
+    RunTrailingStops();
+    WritePositionsFile();
+}
+
+
+//+------------------------------------------------------------------+
+//| COMMAND PROCESSOR                                                 |
+//+------------------------------------------------------------------+
+
+void ProcessCommandsFile()
+{
+    string content = ReadAndClearFile(g_cmdPath);
+    if (StringLen(content) == 0) return;
+
+    string lines[];
+    int count = StringSplit(content, '\n', lines);
+
+    for (int i = 0; i < count; i++) {
+        string line = StringTrimRight(StringTrimLeft(lines[i]));
+        if (StringLen(line) == 0) continue;
+
+        string parts[];
+        int n = StringSplit(line, ' ', parts);
+        if (n < 1) continue;
+
+        string cmd = parts[0];
+
+        if      (cmd == "PLACE_ORDER"    && n >= 8) CmdPlaceOrder(parts, n);
+        else if (cmd == "CANCEL_ORDER"   && n >= 2) CmdCancelOrder(StringToInteger(parts[1]));
+        else if (cmd == "CANCEL_ALL")               CmdCancelAll();
+        else if (cmd == "CLOSE_POSITION" && n >= 2) CmdClosePosition(StringToInteger(parts[1]));
+        else if (cmd == "FORCE_CLOSE"    && n >= 2) CmdClosePosition(StringToInteger(parts[1]));
+        else if (cmd == "UPDATE_SL"      && n >= 3) CmdUpdateSL(StringToInteger(parts[1]),
+                                                                  StringToDouble(parts[2]));
+        else if (cmd == "START_TP"       && n >= 5) CmdStartTP(
+                                                        (int)StringToInteger(parts[1]),
+                                                        StringToDouble(parts[2]),
+                                                        StringToDouble(parts[3]),
+                                                        (int)StringToInteger(parts[4]));
+        else Print("Unknown command: ", line);
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| PLACE_ORDER                                                       |
+//| parts: PLACE_ORDER limit_id signal_id direction price sl lot exp |
+//+------------------------------------------------------------------+
+void CmdPlaceOrder(string &parts[], int n)
+{
+    int    limitId   = (int)StringToInteger(parts[1]);
+    int    signalId  = (int)StringToInteger(parts[2]);
+    string dirStr    = parts[3];   // "BUY_LIMIT" or "SELL_LIMIT"
+    double reqPrice  = StringToDouble(parts[4]);
+    double reqSL     = StringToDouble(parts[5]);
+    double lot       = StringToDouble(parts[6]);
+
+    double ask    = MarketInfo(GoldSymbol, MODE_ASK);
+    double bid    = MarketInfo(GoldSymbol, MODE_BID);
+    double spread = ask - bid;
+    int    digits = (int)MarketInfo(GoldSymbol, MODE_DIGITS);
+
+    // --- Undo Python's fixed spread estimate, apply the live spread ---
+    // Python applied PySpreadEstimate. Remove it, add the real live spread.
+    double delta = spread - PySpreadEstimate;
+
+    bool isBuy = (StringFind(dirStr, "BUY") >= 0);
+    if (isBuy) {
+        reqPrice = NormalizeDouble(reqPrice + delta, digits);
+        reqSL    = NormalizeDouble(reqSL    - delta, digits);
+    } else {
+        reqPrice = NormalizeDouble(reqPrice - delta, digits);
+        reqSL    = NormalizeDouble(reqSL    + delta, digits);
+    }
+
+    // --- Resolve order type ---
+    // BUY_LIMIT:  reqPrice must be BELOW current ask (order sits below price).
+    //             If price has already dropped to/below reqPrice, use BUY_STOP.
+    // SELL_LIMIT: reqPrice must be ABOVE current bid (order sits above price).
+    //             If price has already risen to/above reqPrice, use SELL_STOP.
+    int orderType;
+    if (isBuy) {
+        orderType = (reqPrice < ask) ? OP_BUYLIMIT : OP_BUYSTOP;
+    } else {
+        orderType = (reqPrice > bid) ? OP_SELLLIMIT : OP_SELLSTOP;
+    }
+
+    // --- Skip if price has already blown PAST (through) the limit level ---
+    // BUY_LIMIT sits BELOW current price — skip only if price has already
+    // dropped BELOW the limit (the entry opportunity is gone).
+    // SELL_LIMIT sits ABOVE current price — skip only if price has already
+    // risen ABOVE the limit.
+    if (orderType == OP_BUYLIMIT  && bid < reqPrice - 0.10) {
+        Print("PLACE_ORDER: skip BUY_LIMIT ", reqPrice, " — bid=", bid, " already below level (blown past)");
+        return;
+    }
+    if (orderType == OP_SELLLIMIT && ask > reqPrice + 0.10) {
+        Print("PLACE_ORDER: skip SELL_LIMIT ", reqPrice, " — ask=", ask, " already above level (blown past)");
+        return;
+    }
+
+    // No expiry set on the MT4 order — the Limits-Alert-Bot marks signals as
+    // 'cancelled' in the DB when they expire, and Python's sync engine sends
+    // CANCEL_ORDER to the EA at that point. MT4 never needs to manage expiry.
+    string comment = "lim:" + IntegerToString(limitId) + " sig:" + IntegerToString(signalId);
+
+    int ticket = OrderSend(GoldSymbol, orderType, lot,
+                           reqPrice, 3, reqSL, 0,
+                           comment, MAGIC, 0, clrNONE);
+    if (ticket > 0) {
+        Print("Placed ", OrderTypeStr(orderType), " ticket=", ticket,
+              " price=", reqPrice, " sl=", reqSL, " lot=", lot,
+              " lim=", limitId, " sig=", signalId);
+    } else {
+        int err = GetLastError();
+        Print("OrderSend FAILED err=", err,
+              " type=", OrderTypeStr(orderType), " price=", reqPrice,
+              " sl=", reqSL, " lot=", lot, " ask=", ask, " bid=", bid);
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| CANCEL_ORDER                                                      |
+//+------------------------------------------------------------------+
+void CmdCancelOrder(long ticket)
+{
+    if (!OrderSelect((int)ticket, SELECT_BY_TICKET)) {
+        Print("CANCEL_ORDER: ticket ", ticket, " not found");
+        return;
+    }
+    if (OrderMagicNumber() != MAGIC) return;
+    if (OrderType() <= OP_SELL)      return;   // Not a pending order
+
+    if (OrderDelete((int)ticket))
+        Print("Cancelled order ticket=", ticket);
+    else
+        Print("OrderDelete failed ticket=", ticket, " err=", GetLastError());
+}
+
+
+//+------------------------------------------------------------------+
+//| CANCEL_ALL                                                        |
+//+------------------------------------------------------------------+
+void CmdCancelAll()
+{
+    int cancelled = 0;
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if (OrderMagicNumber() != MAGIC)                 continue;
+        if (OrderType() <= OP_SELL)                      continue;  // Skip positions
+
+        if (OrderDelete(OrderTicket()))
+            cancelled++;
+        else
+            Print("CancelAll: failed ticket=", OrderTicket(), " err=", GetLastError());
+    }
+    g_trailCount = 0;  // Reset trail registry — Python will re-send START_TP as needed
+    Print("CANCEL_ALL: cancelled ", cancelled, " pending order(s).");
+}
+
+
+//+------------------------------------------------------------------+
+//| CLOSE_POSITION / FORCE_CLOSE (full market close)                 |
+//+------------------------------------------------------------------+
+void CmdClosePosition(long ticket)
+{
+    if (!OrderSelect((int)ticket, SELECT_BY_TICKET)) {
+        Print("CLOSE_POSITION: ticket ", ticket, " not found");
+        return;
+    }
+    if (OrderCloseTime() != 0) {
+        Print("CLOSE_POSITION: ticket ", ticket, " already closed");
+        return;
+    }
+    if (OrderMagicNumber() != MAGIC) {
+        Print("CLOSE_POSITION: ticket ", ticket, " not ours (magic mismatch)");
+        return;
+    }
+
+    double closePrice = (OrderType() == OP_BUY)
+        ? MarketInfo(OrderSymbol(), MODE_BID)
+        : MarketInfo(OrderSymbol(), MODE_ASK);
+
+    if (OrderClose((int)ticket, OrderLots(), closePrice, 3, clrNONE)) {
+        Print("Closed position ticket=", ticket);
+        RemoveTrailTicket((int)ticket);
+    } else {
+        Print("OrderClose failed ticket=", ticket, " err=", GetLastError());
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| UPDATE_SL                                                         |
+//+------------------------------------------------------------------+
+void CmdUpdateSL(long ticket, double newSL)
+{
+    if (!OrderSelect((int)ticket, SELECT_BY_TICKET)) {
+        Print("UPDATE_SL: ticket ", ticket, " not found");
+        return;
+    }
+    if (OrderCloseTime() != 0) return;
+
+    double normSL = NormalizeDouble(newSL, (int)MarketInfo(OrderSymbol(), MODE_DIGITS));
+    if (OrderModify((int)ticket, OrderOpenPrice(), normSL, 0, 0, clrNONE))
+        Print("SL updated: ticket=", ticket, " sl=", normSL);
+    else
+        Print("UPDATE_SL failed: ticket=", ticket, " err=", GetLastError());
+}
+
+
+//+------------------------------------------------------------------+
+//| START_TP                                                          |
+//|  1. Close all breakeven sibling positions for signalId           |
+//|  2. Partial close partialPct% of the profit position             |
+//|  3. Register trailing stop on the SAME ticket (MT4 partial close |
+//|     does NOT create a new ticket — volume is reduced in-place)   |
+//+------------------------------------------------------------------+
+void CmdStartTP(int profitTicket, double partialPct, double trailDist, int signalId)
+{
+    Print("START_TP: profitTicket=", profitTicket, " partial=", partialPct,
+          "% trail=", trailDist, "$ signal=", signalId);
+
+    // --- Step 1: Close breakeven siblings ---
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if (OrderMagicNumber() != MAGIC)                 continue;
+        if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+        if (OrderTicket() == profitTicket)               continue;
+
+        int posSig = ParseSigId(OrderComment());
+        if (posSig != signalId) continue;
+
+        double closePrice = (OrderType() == OP_BUY)
+            ? MarketInfo(OrderSymbol(), MODE_BID)
+            : MarketInfo(OrderSymbol(), MODE_ASK);
+
+        int sibTicket = OrderTicket();
+        if (OrderClose(sibTicket, OrderLots(), closePrice, 3, clrNONE))
+            Print("START_TP: closed sibling ticket=", sibTicket);
+        else
+            Print("START_TP: failed to close sibling ticket=", sibTicket,
+                  " err=", GetLastError());
+    }
+
+    // --- Step 2: Select and partially close the profit position ---
+    if (!OrderSelect(profitTicket, SELECT_BY_TICKET)) {
+        Print("START_TP: profit ticket ", profitTicket, " not found");
+        return;
+    }
+    if (OrderCloseTime() != 0) {
+        Print("START_TP: profit ticket ", profitTicket, " already closed");
+        return;
+    }
+
+    double totalLots = OrderLots();
+    double closeLots = NormalizeDouble(totalLots * partialPct / 100.0, 2);
+
+    // Clamp close lots to valid range
+    if (closeLots < 0.01)     closeLots = 0.01;
+    if (closeLots > totalLots) closeLots = totalLots;
+
+    // Snap to broker volume step
+    double volStep = MarketInfo(OrderSymbol(), MODE_LOTSTEP);
+    if (volStep > 0)
+        closeLots = MathFloor(closeLots / volStep) * volStep;
+    closeLots = NormalizeDouble(closeLots, 2);
+
+    double closePrice = (OrderType() == OP_BUY)
+        ? MarketInfo(OrderSymbol(), MODE_BID)
+        : MarketInfo(OrderSymbol(), MODE_ASK);
+
+    bool partialOk = OrderClose(profitTicket, closeLots, closePrice, 3, clrNONE);
+    if (!partialOk) {
+        Print("START_TP: partial close failed ticket=", profitTicket,
+              " lots=", closeLots, " err=", GetLastError());
+        return;
+    }
+    Print("START_TP: partial closed ", closeLots, "/", totalLots,
+          " lots on ticket=", profitTicket);
+
+    // --- Step 3: Register trail on the SAME ticket ---
+    // IMPORTANT: In MT4, a partial close reduces the volume on the original
+    // ticket. The ticket number does NOT change. We trail the original ticket.
+    double remainingLots = totalLots - closeLots;
+    if (remainingLots >= 0.01) {
+        AddTrailTicket(profitTicket, trailDist);
+        Print("START_TP: trail registered on ticket=", profitTicket,
+              " dist=", trailDist, " remaining_lots=", remainingLots);
+    } else {
+        Print("START_TP: position fully closed (no remainder to trail).");
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| TRAILING STOP ENGINE                                             |
+//| Runs on every tick and every timer tick.                         |
+//| Moves SL in the direction of profit — never backward.           |
+//+------------------------------------------------------------------+
+void RunTrailingStops()
+{
+    if (g_trailCount == 0) return;
+
+    for (int i = g_trailCount - 1; i >= 0; i--) {
+        int    ticket = g_trailTickets[i];
+        double dist   = g_trailDistances[i];
+
+        if (!OrderSelect(ticket, SELECT_BY_TICKET)) {
+            Print("Trail: ticket ", ticket, " gone — removing.");
+            RemoveTrailByIndex(i);
+            continue;
+        }
+        if (OrderCloseTime() != 0) {
+            Print("Trail: ticket ", ticket, " closed — removing.");
+            RemoveTrailByIndex(i);
+            continue;
+        }
+
+        int    otype  = OrderType();
+        double curSL  = OrderStopLoss();
+        double openPx = OrderOpenPrice();
+        int    digits = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
+
+        if (otype == OP_BUY) {
+            double bid   = MarketInfo(OrderSymbol(), MODE_BID);
+            double newSL = NormalizeDouble(bid - dist, digits);
+            // Only ratchet the SL upward — never lower it
+            if (newSL > curSL + 0.005) {
+                if (!OrderModify(ticket, openPx, newSL, 0, 0, clrNONE))
+                    Print("Trail BUY: modify failed ticket=", ticket,
+                          " err=", GetLastError());
+            }
+        }
+        else if (otype == OP_SELL) {
+            double ask   = MarketInfo(OrderSymbol(), MODE_ASK);
+            double newSL = NormalizeDouble(ask + dist, digits);
+            // Only ratchet the SL downward — never raise it
+            if (curSL == 0 || newSL < curSL - 0.005) {
+                if (!OrderModify(ticket, openPx, newSL, 0, 0, clrNONE))
+                    Print("Trail SELL: modify failed ticket=", ticket,
+                          " err=", GetLastError());
+            }
+        }
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| POSITIONS FILE WRITER                                            |
+//| Writes full snapshot every tick so Python has near-real-time     |
+//| fill detection.                                                  |
+//+------------------------------------------------------------------+
+void WritePositionsFile()
+{
+    string out = "";
+
+    // Header line: account balance for Python lot-sizing sync
+    out += "# BALANCE " + DoubleToString(AccountBalance(), 2) + "\n";
+
+    // --- PENDING ORDERS ---
+    for (int i = 0; i < OrdersTotal(); i++) {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if (OrderMagicNumber() != MAGIC)                 continue;
+        if (OrderType() <= OP_SELL)                      continue;  // Pending types only
+
+        int limId  = ParseLimId(OrderComment());
+        int sigId  = ParseSigId(OrderComment());
+
+        out += StringFormat(
+            "PENDING %d %d %d %s %.5f %.5f %.2f\n",
+            OrderTicket(), limId, sigId,
+            OrderTypeStr(OrderType()),
+            OrderOpenPrice(), OrderStopLoss(), OrderLots()
+        );
+    }
+
+    out += "---\n";
+
+    // --- OPEN POSITIONS ---
+    for (int i = 0; i < OrdersTotal(); i++) {
+        if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if (OrderMagicNumber() != MAGIC)                 continue;
+        if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+
+        int limId  = ParseLimId(OrderComment());
+        int sigId  = ParseSigId(OrderComment());
+        string typ = (OrderType() == OP_BUY) ? "BUY" : "SELL";
+
+        out += StringFormat(
+            "POSITION %d %d %d %s %.5f %.5f %.2f %.2f\n",
+            OrderTicket(), limId, sigId, typ,
+            OrderOpenPrice(), OrderStopLoss(), OrderLots(), OrderProfit()
+        );
+    }
+
+    WriteFile(g_posPath, out);
+}
+
+
+//+------------------------------------------------------------------+
+//| COMMENT PARSING                                                  |
+//| Comment format: "lim:123 sig:456"                                |
+//+------------------------------------------------------------------+
+int ParseLimId(string comment)
+{
+    int p = StringFind(comment, "lim:");
+    if (p < 0) return 0;
+    string rest = StringSubstr(comment, p + 4);
+    string pts[]; StringSplit(rest, ' ', pts);
+    return (ArraySize(pts) > 0) ? (int)StringToInteger(pts[0]) : 0;
+}
+
+int ParseSigId(string comment)
+{
+    int p = StringFind(comment, "sig:");
+    if (p < 0) return 0;
+    string rest = StringSubstr(comment, p + 4);
+    string pts[]; StringSplit(rest, ' ', pts);
+    return (ArraySize(pts) > 0) ? (int)StringToInteger(pts[0]) : 0;
+}
+
+string OrderTypeStr(int type)
+{
+    switch (type) {
+        case OP_BUY:       return "BUY";
+        case OP_SELL:      return "SELL";
+        case OP_BUYLIMIT:  return "BUY_LIMIT";
+        case OP_SELLLIMIT: return "SELL_LIMIT";
+        case OP_BUYSTOP:   return "BUY_STOP";
+        case OP_SELLSTOP:  return "SELL_STOP";
+        default:           return "UNKNOWN";
+    }
+}
+
+
+
+//+------------------------------------------------------------------+
+//| TRAIL REGISTRY HELPERS                                           |
+//+------------------------------------------------------------------+
+void AddTrailTicket(int ticket, double dist)
+{
+    for (int i = 0; i < g_trailCount; i++) {
+        if (g_trailTickets[i] == ticket) {
+            g_trailDistances[i] = dist;  // Update distance if re-registered
+            return;
+        }
+    }
+    if (g_trailCount >= MAX_TRAIL) {
+        Print("Trail registry full (max=", MAX_TRAIL, ") — cannot add ticket=", ticket);
+        return;
+    }
+    g_trailTickets[g_trailCount]   = ticket;
+    g_trailDistances[g_trailCount] = dist;
+    g_trailCount++;
+}
+
+void RemoveTrailTicket(int ticket)
+{
+    for (int i = 0; i < g_trailCount; i++) {
+        if (g_trailTickets[i] == ticket) { RemoveTrailByIndex(i); return; }
+    }
+}
+
+void RemoveTrailByIndex(int idx)
+{
+    for (int i = idx; i < g_trailCount - 1; i++) {
+        g_trailTickets[i]   = g_trailTickets[i + 1];
+        g_trailDistances[i] = g_trailDistances[i + 1];
+    }
+    g_trailCount--;
+}
+
+
+//+------------------------------------------------------------------+
+//| LOW-LEVEL FILE I/O (Windows API — works outside MT4 sandbox)    |
+//+------------------------------------------------------------------+
+
+string ReadAndClearFile(string path)
+{
+    int fh = CreateFileW(path,
+                         GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         0, OPEN_EXISTING, 0, 0);
+    if (fh == INVALID_HANDLE_VALUE) return "";
+
+    uchar buf[];
+    ArrayResize(buf, 65536);
+    uint bytesRead = 0;
+    if (!ReadFile(fh, buf, ArraySize(buf) - 1, bytesRead, 0)) {
+        CloseHandle(fh);
+        return "";
+    }
+    buf[bytesRead] = 0;
+    string content = CharArrayToString(buf, 0, bytesRead, CP_UTF8);
+
+    // Truncate file after reading (acts as a queue: read-and-clear)
+    int hi = 0;
+    SetFilePointer(fh, 0, hi, FILE_BEGIN);
+    SetEndOfFile(fh);
+    CloseHandle(fh);
+    return content;
+}
+
+bool WriteFile(string path, string content)
+{
+    int fh = CreateFileW(path,
+                         GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         0, OPEN_EXISTING, 0, 0);
+    if (fh == INVALID_HANDLE_VALUE) {
+        Print("WriteFile: cannot open ", path);
+        return false;
+    }
+    int hi = 0;
+    SetFilePointer(fh, 0, hi, FILE_BEGIN);
+    SetEndOfFile(fh);
+
+    uchar buf[];
+    int len = StringToCharArray(content, buf, 0, WHOLE_ARRAY, CP_UTF8);
+    uint written = 0;
+    bool ok = WriteFile(fh, buf, len - 1, written, 0);
+    CloseHandle(fh);
+    return ok;
+}
+
+void EnsureFileExists(string path)
+{
+    // Try OPEN_EXISTING first
+    int fh = CreateFileW(path,
+                         GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         0, OPEN_EXISTING, 0, 0);
+    if (fh != INVALID_HANDLE_VALUE) { CloseHandle(fh); return; }
+
+    // Does not exist — create it
+    fh = CreateFileW(path,
+                     GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+                     0, CREATE_ALWAYS, 0, 0);
+    if (fh != INVALID_HANDLE_VALUE) {
+        CloseHandle(fh);
+        Print("Created: ", path);
+    } else {
+        Print("EnsureFileExists: could not create ", path);
+    }
+}
