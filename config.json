@@ -6,7 +6,8 @@
 
   "execution": {
     "risk_percent": 2.0,
-    "min_lot": 0.01
+    "min_lot": 0.01,
+    "proximity_filter_dollars": 50.0
   },
 
   "tp": {

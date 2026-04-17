@@ -454,8 +454,9 @@ void WritePositionsFile()
 {
     string out = "";
 
-    // Header line: account balance for Python lot-sizing sync
+    // Header lines: account balance for lot-sizing sync, bid for proximity filter
     out += "# BALANCE " + DoubleToString(AccountBalance(), 2) + "\n";
+    out += "# BID "     + DoubleToString(MarketInfo(GoldSymbol, MODE_BID), 5) + "\n";
 
     // --- PENDING ORDERS ---
     for (int i = 0; i < OrdersTotal(); i++) {

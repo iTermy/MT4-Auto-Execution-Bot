@@ -207,6 +207,16 @@ class SyncEngine:
         # Account balance — seeded from config, updated each cycle from EA report
         self._cached_balance: float = float(config.get("account_balance", 10000.0))
 
+        # Current bid price — updated each cycle from EA's # BID header
+        self._cached_bid: Optional[float] = None
+
+        # Proximity filter: only place orders for signals that have at least one
+        # pending limit within this many dollars of the current bid price.
+        # 0 = disabled (place all signals regardless of distance).
+        self.proximity_filter_dollars: float = float(
+            exec_cfg.get("proximity_filter_dollars", 50.0)
+        )
+
         self._tp_engine           = TPEngine(config, self.conn_path)
         self._forced_exit_monitor = ForcedExitMonitor(self.conn_path)
 
@@ -270,6 +280,8 @@ class SyncEngine:
                     f"Balance: {self._cached_balance:.2f} → {snap.balance:.2f}"
                 )
                 self._cached_balance = snap.balance
+        if snap.bid_price is not None and snap.bid_price > 0:
+            self._cached_bid = snap.bid_price
 
     # ------------------------------------------------------------------
     # Market hours state machine
@@ -327,6 +339,29 @@ class SyncEngine:
     # Order sync
     # ------------------------------------------------------------------
 
+    def _signal_is_in_proximity(self, sig: dict) -> bool:
+        """
+        Return True if this signal should have orders placed, based on the
+        proximity filter. A signal passes if:
+          - proximity_filter_dollars is 0 (filter disabled), OR
+          - no current bid price is known yet (can't filter, allow through), OR
+          - at least one of its pending limits is within proximity_filter_dollars
+            of the current bid price.
+
+        Signals are treated as atomic — if ANY limit qualifies, ALL limits for
+        that signal are placed. This method only decides pass/fail per signal.
+        """
+        threshold = self.proximity_filter_dollars
+        if threshold <= 0:
+            return True  # Filter disabled
+        if self._cached_bid is None:
+            return True  # No price data yet — allow through
+        bid = self._cached_bid
+        for lim in sig.get("pending_limits", []):
+            if abs(lim["price_level"] - bid) <= threshold:
+                return True
+        return False
+
     async def _sync_orders(self) -> None:
         """
         Main diff loop:
@@ -353,12 +388,31 @@ class SyncEngine:
         # signal's lifetime. Fetched in bulk to avoid per-signal round-trips.
         avg_sl_by_signal = await self._compute_avg_sl_distances(signals)
 
+        # Signals that already have any tracked limit (pending or filled).
+        # These bypass the proximity filter — we never want to stop managing
+        # a signal we've already started placing orders for.
+        already_tracked_signal_ids = local_db.get_all_tracked_signal_ids()
+
         # --- Place missing orders ---
         for limit_id, lim in db_pending.items():
             if limit_id in tracked:
                 continue
             sig = lim["_signal"]
-            self._place_order(lim, sig, avg_sl_by_signal.get(sig["id"]))
+            signal_id = sig["id"]
+
+            # Proximity filter: skip new signals whose closest limit is too
+            # far from the current price. Signals already being tracked are
+            # always allowed through so existing order management is unaffected.
+            if signal_id not in already_tracked_signal_ids:
+                if not self._signal_is_in_proximity(sig):
+                    logger.debug(
+                        f"Signal {signal_id}: all limits outside "
+                        f"{self.proximity_filter_dollars:.0f}$ proximity "
+                        f"(bid={self._cached_bid}) — skipping placement."
+                    )
+                    continue
+
+            self._place_order(lim, sig, avg_sl_by_signal.get(signal_id))
 
         # --- Cancel orders for limits no longer pending in DB ---
         local_pending = local_db.get_pending_mappings()

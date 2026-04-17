@@ -183,9 +183,10 @@ class PositionSnapshot:
     """Parsed snapshot from positions.txt."""
 
     def __init__(self):
-        self.pending_orders: list[dict] = []   # MT4 pending orders
-        self.open_positions: list[dict] = []   # MT4 open positions
-        self.balance: Optional[float]   = None # Account balance reported by EA
+        self.pending_orders: list[dict] = []
+        self.open_positions: list[dict] = []
+        self.balance: Optional[float] = None
+        self.bid_price: Optional[float] = None  # ← ADD THIS
 
     @property
     def pending_tickets(self) -> set[int]:
