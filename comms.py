@@ -232,6 +232,12 @@ def read_positions(conn_path: str) -> Optional[PositionSnapshot]:
             except (IndexError, ValueError):
                 pass
             continue
+        if line.startswith("# BID "):
+            try:
+                snap.bid_price = float(line.split()[2])
+            except (IndexError, ValueError):
+                pass
+            continue
         if line == "---":
             in_positions_section = True
             continue

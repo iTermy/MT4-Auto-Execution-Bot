@@ -370,6 +370,13 @@ class SyncEngine:
           • Cancel orders for limits no longer pending in DB.
           • Cancel all orders for signals that have left active/hit.
         """
+        if self._cached_bid is None and self.proximity_filter_dollars > 0:
+            logger.info(
+                "No bid price yet — skipping order placement until EA reports "
+                "a price (proximity filter cannot run without it)."
+            )
+            return
+
         signals = await supabase_db.fetch_active_gold_signals_with_limits(self.pool)
 
         db_pending: dict[int, dict] = {}  # limit_id → enriched limit dict

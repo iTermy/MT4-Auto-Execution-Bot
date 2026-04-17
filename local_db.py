@@ -269,7 +269,13 @@ def get_all_tracked_limit_ids(db_path: str = DB_PATH) -> set[int]:
 
 
 def get_all_tracked_signal_ids(db_path: str = DB_PATH) -> set[int]:
-    sql = "SELECT DISTINCT signal_id FROM order_mappings"
+    """
+    Signal_ids that have at least one active (pending or filled) order mapping.
+    Excludes cancelled/error so that signals whose orders were all cancelled
+    (e.g. after a market-close pause) are re-evaluated by the proximity filter
+    on the next placement cycle, rather than bypassing it indefinitely.
+    """
+    sql = "SELECT DISTINCT signal_id FROM order_mappings WHERE status IN ('pending', 'filled')"
     with get_conn(db_path) as conn:
         return {r["signal_id"] for r in conn.execute(sql).fetchall()}
 
