@@ -15,7 +15,7 @@
       "metals": { "type": "dollars", "value": 5.0, "trail": 2.0 }
     },
     "scalp_defaults": {
-      "metals": { "type": "dollars", "value": 2.0, "trail": 1.0 }
+      "metals": { "type": "dollars", "value": 5.0, "trail": 3.0 }
     },
     "overrides": {},
     "scalp_overrides": {},

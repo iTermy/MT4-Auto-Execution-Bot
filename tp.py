@@ -122,31 +122,34 @@ class TPEngine:
 
         threshold, trail_dollars, partial_pct = _resolve_tp_params(self.config, is_scalp)
 
-        # Most recently hit = highest ticket number
+        # Deepest position = highest ticket (placed last = furthest into the move)
         profit_pos = max(active, key=lambda p: p["ticket"])
         breakeven_siblings = [p for p in active if p["ticket"] != profit_pos["ticket"]]
 
-        # Calculate dollars above entry for the profit position
-        profit_dollars = self._dollars_above_entry(profit_pos)
+        # threshold is in price-movement dollars (e.g. 2.0 = $2 price move on XAUUSD).
+        # Convert account P&L to price movement: profit / (lots * 100)
+        # XAUUSD: 1 lot = 100oz, so $1 price move = $100 account P&L per lot.
+        profit_price_move = self._price_move(profit_pos)
 
-        if profit_dollars < threshold:
-            return  # Not enough profit yet
+        if profit_price_move < threshold:
+            return  # Deepest position hasn't moved far enough yet
 
-        # Check all siblings are at breakeven or better
-        for sibling in breakeven_siblings:
-            sibling_dollars = self._dollars_above_entry(sibling)
-            if sibling_dollars < 0:
+        # Combined sibling breakeven: sum of all siblings' P&L must be >= 0.
+        # Individual siblings may be slightly negative as long as the group nets out.
+        if breakeven_siblings:
+            combined_sibling_pnl = sum(p.get("profit", 0.0) or 0.0 for p in breakeven_siblings)
+            if combined_sibling_pnl < 0:
                 logger.debug(
-                    f"TP check signal {signal_id}: sibling ticket "
-                    f"{sibling['ticket']} is {sibling_dollars:.2f}$ below entry — waiting."
+                    f"TP check signal {signal_id}: combined sibling P&L "
+                    f"${combined_sibling_pnl:.2f} — waiting for breakeven."
                 )
-                return  # Not all siblings at breakeven
+                return  # Siblings not at combined breakeven yet
 
         # All conditions met — fire TP
         logger.info(
             f"TP trigger: signal={signal_id}, profit_ticket={profit_pos['ticket']} "
-            f"({profit_dollars:.2f}$ profit, threshold={threshold}$), "
-            f"{len(breakeven_siblings)} breakeven sibling(s). "
+            f"({profit_price_move:.2f}$ price move, threshold={threshold}$), "
+            f"{len(breakeven_siblings)} sibling(s) at combined breakeven. "
             f"Sending START_TP (partial={partial_pct}%, trail={trail_dollars}$)."
         )
 
@@ -180,20 +183,19 @@ class TPEngine:
             cmd_cancel_order(self.conn_path, ticket)
             logger.info(f"TP fired for signal {signal_id} — cancelled pending ticket {ticket}")
 
-    def _dollars_above_entry(self, pos: dict) -> float:
+    def _price_move(self, pos: dict) -> float:
         """
-        Return how many dollars per lot the position is in profit above entry.
+        Return the price movement in dollars from entry for this position.
 
-        For gold (XAUUSD): 1 lot = 100 oz. $1 price move = $100 per lot.
-        profit field from MT4 is total P&L in account currency.
-        We compute dollars-per-lot for threshold comparison to stay consistent
-        regardless of lot size.
+        The profit field from MT4 is total account P&L in account currency.
+        For XAUUSD: 1 lot = 100oz, so $1 price move = $100 account P&L per lot.
 
-        Formula: profit_dollars_per_lot = total_profit / lots
-        This is the dollar P&L per 1 standard lot, which matches the
-        "dollars" unit used in the TP config (e.g. "value": 5.0 means
-        $5 per lot profit on the most-recently-hit position).
+        price_move = total_profit / (lots * 100)
+
+        This matches config "value" semantics: e.g. "value": 2.0 means the
+        deepest position must have moved $2 in price from its entry.
+        Scale-independent — works correctly regardless of lot size.
         """
         lots = pos.get("lots", 1.0) or 1.0
         total_profit = pos.get("profit", 0.0) or 0.0
-        return total_profit / lots
+        return total_profit / (lots * 100.0)
